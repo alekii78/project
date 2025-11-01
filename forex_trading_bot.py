@@ -1,141 +1,139 @@
-# ==========================================
-# Forex Signal Trading Script (Converted from Jupyter Notebook)
-# ==========================================
-
-# 1 - Import test data
-import yfinance as yf
+import asyncio
+import json
 import pandas as pd
+import websockets
+from config import DERIV_TOKEN, DERIV_APP_ID
 
-# Download EUR/USD data (15-minute interval)
-dataF = yf.download("EURUSD=X", start="2022-10-7", end="2022-12-5", interval='15m')
-print(dataF)
+DERIV_SYMBOL = "frxEURUSD"
+TRADE_INTERVAL = 15  # in minutes
+STAKE = 1  # USD
 
-# ==========================================
-# 2 - Define your signal function
-# ==========================================
+
+async def get_valid_duration(symbol):
+    """Fetch the minimum valid contract duration for the symbol."""
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+        await ws.recv()
+
+        await ws.send(json.dumps({"contracts_for": symbol}))
+        resp = await ws.recv()
+        data = json.loads(resp)
+
+        contracts = data.get("contracts_for", {}).get("available", [])
+        for c in contracts:
+            if "forex" in c.get("underlying", ""):
+                # Use the first valid duration
+                return int(c.get("min_contract_duration", 1))
+        return 1  # fallback
+
+
+async def get_deriv_candles(n=5, granularity=15):
+    """Fetch latest n candles from Deriv."""
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+        await ws.recv()
+
+        request = {
+            "ticks_history": DERIV_SYMBOL,
+            "end": "latest",
+            "count": n,
+            "granularity": granularity * 60,
+            "style": "candles"
+        }
+        await ws.send(json.dumps(request))
+        resp = await ws.recv()
+        data = json.loads(resp)
+
+        print("DEBUG Raw response from Deriv:", data)
+
+        candles = data.get("candles")
+        if not candles:
+            print("⚠️ No candles received from Deriv.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(candles)
+        df.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close'}, inplace=True)
+        for col in ['Open','High','Low','Close']:
+            df[col] = df[col].astype(float)
+        return df
+
+
 def signal_generator(df):
+    """Generate BUY/SELL signals based on last two candles."""
+    if len(df) < 2:
+        return 0
     open_ = df.Open.iloc[-1]
     close_ = df.Close.iloc[-1]
-    previous_open = df.Open.iloc[-2]
-    previous_close = df.Close.iloc[-2]
+    prev_open = df.Open.iloc[-2]
+    prev_close = df.Close.iloc[-2]
 
-    # Bearish Pattern
-    if (open_ > close_ and
-        previous_open < previous_close and
-        close_ < previous_open and
-        open_ >= previous_close):
-        return 1
+    if open_ > close_ and prev_open < prev_close and close_ < prev_open and open_ >= prev_close:
+        return 1  # SELL
+    elif open_ < close_ and prev_open > prev_close and close_ > prev_open and open_ <= prev_close:
+        return 2  # BUY
+    return 0
 
-    # Bullish Pattern
-    elif (open_ < close_ and
-          previous_open > previous_close and
-          close_ > previous_open and
-          open_ <= previous_close):
-        return 2
 
-    # No clear pattern
-    else:
-        return 0
+async def trade_on_deriv(signal, stake=STAKE, duration=None):
+    """Execute a CALL or PUT contract on Deriv."""
+    if duration is None:
+        duration = await get_valid_duration(DERIV_SYMBOL)
 
-# Generate signals
-signal = [0]
-for i in range(1, len(dataF)):
-    df = dataF[i-1:i+1]
-    signal.append(signal_generator(df))
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+        await ws.recv()
 
-dataF["signal"] = signal
-print(dataF.signal.value_counts())
+        contract_type = "CALL" if signal == 2 else "PUT"
+        proposal = {
+            "proposal": 1,
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": duration,
+            "duration_unit": "m",
+            "symbol": DERIV_SYMBOL
+        }
 
-# ==========================================
-# 3 - Connect to the market and execute trades
-# ==========================================
-from apscheduler.schedulers.blocking import BlockingScheduler
-from oandapyV20 import API
-import oandapyV20.endpoints.orders as orders
-from oandapyV20.contrib.requests import MarketOrderRequest
-from oanda_candles import Pair, Gran, CandleClient
-from oandapyV20.contrib.requests import TakeProfitDetails, StopLossDetails
+        await ws.send(json.dumps(proposal))
+        proposal_resp = await ws.recv()
+        proposal_data = json.loads(proposal_resp)
 
-# ==========================================
-# 4 - OANDA connection setup
-# ==========================================
-from config import access_token, accountID  # Your OANDA credentials file
+        if "error" in proposal_data:
+            print("❌ Proposal error:", proposal_data["error"]["message"])
+            return
 
-def get_candles(n):
-    # Create OANDA candle client (set real=True for live)
-    client = CandleClient(access_token, real=False)
-    collector = client.get_collector(Pair.EUR_USD, Gran.M15)
-    candles = collector.grab(n)
-    return candles
+        contract_id = proposal_data["proposal"]["id"]
+        await ws.send(json.dumps({"buy": contract_id, "price": stake}))
+        buy_resp = await ws.recv()
+        print("💰 Trade executed:", buy_resp)
 
-# Test connection
-candles = get_candles(3)
-for candle in candles:
-    print(float(str(candle.bid.o)) > 1)
 
-# ==========================================
-# 5 - Define trading job
-# ==========================================
-def trading_job():
-    candles = get_candles(3)
-    dfstream = pd.DataFrame(columns=['Open', 'Close', 'High', 'Low'])
+async def trading_loop():
+    """Run trading job continuously every TRADE_INTERVAL minutes."""
+    while True:
+        try:
+            print("🚀 Running trading job...")
+            df = await get_deriv_candles()
+            print("Latest candles:\n", df.tail())
 
-    for i, candle in enumerate(candles):
-        dfstream.loc[i, ['Open']] = float(str(candle.bid.o))
-        dfstream.loc[i, ['Close']] = float(str(candle.bid.c))
-        dfstream.loc[i, ['High']] = float(str(candle.bid.h))
-        dfstream.loc[i, ['Low']] = float(str(candle.bid.l))
+            signal = signal_generator(df)
+            print("Signal:", "SELL" if signal == 1 else "BUY" if signal == 2 else "NONE")
 
-    dfstream = dfstream.astype(float)
+            if signal in (1, 2):
+                await trade_on_deriv(signal)
+            else:
+                print("⚪ No trade this round.")
 
-    signal = signal_generator(dfstream.iloc[:-1, :])
+        except Exception as e:
+            print("⚠️ Error during trading job:", e)
 
-    # Connect to OANDA API
-    client = API(access_token)
+        print(f"⏳ Waiting {TRADE_INTERVAL} minutes before next trade...\n")
+        await asyncio.sleep(TRADE_INTERVAL * 60)
 
-    SLTPRatio = 2.0
-    previous_candleR = abs(dfstream['High'].iloc[-2] - dfstream['Low'].iloc[-2])
 
-    SLBuy = float(str(candle.bid.o)) - previous_candleR
-    SLSell = float(str(candle.bid.o)) + previous_candleR
-
-    TPBuy = float(str(candle.bid.o)) + previous_candleR * SLTPRatio
-    TPSell = float(str(candle.bid.o)) - previous_candleR * SLTPRatio
-
-    print(dfstream.iloc[:-1, :])
-    print(TPBuy, SLBuy, TPSell, SLSell)
-
-    # Example: force a Buy for testing
-    signal = 2
-
-    if signal == 1:  # Sell
-        mo = MarketOrderRequest(
-            instrument="EUR_USD",
-            units=-1000,
-            takeProfitOnFill=TakeProfitDetails(price=TPSell).data,
-            stopLossOnFill=StopLossDetails(price=SLSell).data
-        )
-        r = orders.OrderCreate(accountID, data=mo.data)
-        rv = client.request(r)
-        print(rv)
-
-    elif signal == 2:  # Buy
-        mo = MarketOrderRequest(
-            instrument="EUR_USD",
-            units=1000,
-            takeProfitOnFill=TakeProfitDetails(price=TPBuy).data,
-            stopLossOnFill=StopLossDetails(price=SLBuy).data
-        )
-        r = orders.OrderCreate(accountID, data=mo.data)
-        rv = client.request(r)
-        print(rv)
-
-# ==========================================
-# 6 - Run or schedule
-# ==========================================
 if __name__ == "__main__":
-    trading_job()
-    # Uncomment below for scheduling automatic runs
-    scheduler = BlockingScheduler()
-    scheduler.add_job(trading_job, 'cron', day_of_week='mon-fri', hour='00-23', minute='1,16,31,46', timezone='America/Chicago' )
-    scheduler.start()
+    asyncio.run(trading_loop())
