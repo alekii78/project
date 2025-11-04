@@ -1,42 +1,43 @@
 import asyncio
 import json
 import pandas as pd
+import random
 import websockets
 from config import DERIV_TOKEN, DERIV_APP_ID
 
-DERIV_SYMBOL = "frxEURUSD"
-TRADE_INTERVAL = 15  # in minutes
-STAKE = 1  # USD
+TRADE_INTERVAL = 1  # trade every 1 minute
+STAKE = 1  # USD stake per trade
+DERIV_SYMBOLS = ["R_100", "R_25"]  # Synthetic indices trade 24/7
 
 
-async def get_valid_duration(symbol):
-    """Fetch the minimum valid contract duration for the symbol."""
+# -------------------- Helper Functions --------------------
+
+async def get_valid_symbol():
+    """Return the first available synthetic index symbol."""
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     async with websockets.connect(uri) as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
 
-        await ws.send(json.dumps({"contracts_for": symbol}))
+        await ws.send(json.dumps({"active_symbols": "brief", "product_type": "synthetic_index"}))
         resp = await ws.recv()
         data = json.loads(resp)
-
-        contracts = data.get("contracts_for", {}).get("available", [])
-        for c in contracts:
-            if "forex" in c.get("underlying", ""):
-                # Use the first valid duration
-                return int(c.get("min_contract_duration", 1))
-        return 1  # fallback
+        available = [s["symbol"] for s in data.get("active_symbols", [])]
+        for sym in DERIV_SYMBOLS:
+            if sym in available:
+                return sym
+    return DERIV_SYMBOLS[0]
 
 
-async def get_deriv_candles(n=5, granularity=15):
-    """Fetch latest n candles from Deriv."""
+async def get_deriv_candles(symbol, n=5, granularity=1):
+    """Fetch latest n candles for a symbol."""
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     async with websockets.connect(uri) as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
 
         request = {
-            "ticks_history": DERIV_SYMBOL,
+            "ticks_history": symbol,
             "end": "latest",
             "count": n,
             "granularity": granularity * 60,
@@ -46,22 +47,19 @@ async def get_deriv_candles(n=5, granularity=15):
         resp = await ws.recv()
         data = json.loads(resp)
 
-        print("DEBUG Raw response from Deriv:", data)
-
         candles = data.get("candles")
         if not candles:
-            print("⚠️ No candles received from Deriv.")
             return pd.DataFrame()
 
         df = pd.DataFrame(candles)
-        df.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close'}, inplace=True)
-        for col in ['Open','High','Low','Close']:
+        df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        for col in ['Open', 'High', 'Low', 'Close']:
             df[col] = df[col].astype(float)
         return df
 
 
 def signal_generator(df):
-    """Generate BUY/SELL signals based on last two candles."""
+    """Simple BUY/SELL signal generator using last two candles."""
     if len(df) < 2:
         return 0
     open_ = df.Open.iloc[-1]
@@ -69,33 +67,38 @@ def signal_generator(df):
     prev_open = df.Open.iloc[-2]
     prev_close = df.Close.iloc[-2]
 
-    if open_ > close_ and prev_open < prev_close and close_ < prev_open and open_ >= prev_close:
+    # Basic reversal or momentum detection
+    if open_ > close_ and prev_open < prev_close:
         return 1  # SELL
-    elif open_ < close_ and prev_open > prev_close and close_ > prev_open and open_ <= prev_close:
+    elif open_ < close_ and prev_open > prev_close:
         return 2  # BUY
-    return 0
+    elif df.Close.iloc[-1] > df.Close.iloc[-2]:
+        return 2  # BUY
+    elif df.Close.iloc[-1] < df.Close.iloc[-2]:
+        return 1  # SELL
+
+    return random.choice([1, 2])  # random if no clear signal
 
 
-async def trade_on_deriv(signal, stake=STAKE, duration=None):
-    """Execute a CALL or PUT contract on Deriv."""
-    if duration is None:
-        duration = await get_valid_duration(DERIV_SYMBOL)
-
+async def trade_on_deriv(symbol, signal, stake=STAKE):
+    """Place a single trade based on signal."""
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     async with websockets.connect(uri) as ws:
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         await ws.recv()
 
         contract_type = "CALL" if signal == 2 else "PUT"
+        print(f"📈 Placing {contract_type} trade for {symbol} ...")
+
         proposal = {
             "proposal": 1,
             "amount": stake,
             "basis": "stake",
             "contract_type": contract_type,
             "currency": "USD",
-            "duration": duration,
+            "duration": 1,
             "duration_unit": "m",
-            "symbol": DERIV_SYMBOL
+            "symbol": symbol
         }
 
         await ws.send(json.dumps(proposal))
@@ -103,37 +106,48 @@ async def trade_on_deriv(signal, stake=STAKE, duration=None):
         proposal_data = json.loads(proposal_resp)
 
         if "error" in proposal_data:
-            print("❌ Proposal error:", proposal_data["error"]["message"])
-            return
+            print(f"❌ Proposal failed: {proposal_data['error']['message']}")
+            return False
 
         contract_id = proposal_data["proposal"]["id"]
         await ws.send(json.dumps({"buy": contract_id, "price": stake}))
         buy_resp = await ws.recv()
-        print("💰 Trade executed:", buy_resp)
+        print(f"💰 Trade executed for {symbol}: {buy_resp}")
+        return True
 
+
+# -------------------- Continuous Trading Loop --------------------
 
 async def trading_loop():
-    """Run trading job continuously every TRADE_INTERVAL minutes."""
+    """Run continuous trading."""
     while True:
         try:
-            print("🚀 Running trading job...")
-            df = await get_deriv_candles()
-            print("Latest candles:\n", df.tail())
+            symbol = await get_valid_symbol()
+            print(f"\n✅ Using symbol: {symbol}")
 
+            df = await get_deriv_candles(symbol, granularity=1)
+            if df.empty:
+                print("⚠️ No candle data available.")
+                await asyncio.sleep(5)
+                continue
+
+            print(df.tail())
             signal = signal_generator(df)
-            print("Signal:", "SELL" if signal == 1 else "BUY" if signal == 2 else "NONE")
+            print("📊 Signal:", "SELL" if signal == 1 else "BUY")
 
-            if signal in (1, 2):
-                await trade_on_deriv(signal)
-            else:
-                print("⚪ No trade this round.")
+            success = await trade_on_deriv(symbol, signal)
+            if not success:
+                print(f"⚠️ Trade failed on {symbol}, switching symbol...")
+                continue
+
+            print(f"⏳ Waiting {TRADE_INTERVAL} minute(s) before next trade...\n")
+            await asyncio.sleep(TRADE_INTERVAL * 60)
 
         except Exception as e:
-            print("⚠️ Error during trading job:", e)
-
-        print(f"⏳ Waiting {TRADE_INTERVAL} minutes before next trade...\n")
-        await asyncio.sleep(TRADE_INTERVAL * 60)
+            print("⚠️ Error in trading loop:", e)
+            await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
+    print("🚀 Starting continuous Deriv bot (demo)...\n")
     asyncio.run(trading_loop())
